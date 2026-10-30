@@ -1,92 +1,74 @@
-struct LinearRegression {
-    weights: Vec<f64>,
-    bias: f64,
-}
+mod csv;
+mod linear_regression;
 
-impl LinearRegression {
-    // CONSTRUCTOR
-    fn new(n_features: usize) -> Self {
-        Self {
-            weights: vec![0.0; n_features],
-            bias: 0.0,
+use csv::{load_csv, train_test_split};
+use linear_regression::{LinearRegression, TrainConfig, mse, r2};
+use std::env;
+use std::error::Error;
+use std::process::ExitCode;
+
+const DEFAULT_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/penguins.csv");
+const DEFAULT_TARGET: &str = "body_mass_g";
+const DEFAULT_FEATURES: [&str; 3] = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm"];
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {}", error);
+            eprintln!("usage: cargo run -- [<csv file> <target column> <feature column>...]");
+            ExitCode::FAILURE
         }
-    }
-
-    // CALCULATES ŷ
-    fn predict(&self, x: &[f64]) -> f64 {
-        let mut total = self.bias;
-
-        for (u, v) in self.weights.iter().zip(x.iter()) {
-            total += u * v;
-        }
-
-        total
-    }
-
-    // CALCULATES LOSS
-    fn mse(predictions: &[f64], targets: &[f64]) -> f64 {
-        assert_eq!(predictions.len(), targets.len());
-        let mut sum = 0.0;
-        for (prediction, target) in predictions.iter().zip(targets.iter()) {
-            let error = prediction - target;
-            sum += error * error;
-        }
-        sum / predictions.len() as f64
-    }
-
-    //CALCULATES GRADIENTS
-    fn gradients(&self, xs: &[Vec<f64>], ys: &[f64]) -> (Vec<f64>, f64) {
-        // return (gradient of w, gradient of b)
-        assert_eq!(xs.len(), ys.len());
-        let mut grad_w = vec![0.0; self.weights.len()];
-        let mut grad_b: f64 = 0.0;
-        for (x, y) in xs.iter().zip(ys.iter()) {
-            let error = self.predict(x) - y;
-            for j in 0..x.len() {
-                grad_w[j] += error * x[j];
-            }
-            grad_b += error;
-        }
-        let n = xs.len() as f64;
-        for g in grad_w.iter_mut() {
-            *g = 2.0 * *g / n;
-        }
-        (grad_w, 2.0 * grad_b / n)
-    }
-
-    // TAKES ONE GRADIENT DESCENT STEP
-    fn step(&mut self, xs: &[Vec<f64>], ys: &[f64], learning_rate: f64) {
-        let (grad_w, grad_b) = self.gradients(xs, ys);
-
-        for (w, g) in self.weights.iter_mut().zip(grad_w.iter()) {
-            *w -= learning_rate * g;
-        }
-
-        self.bias -= learning_rate * grad_b;
     }
 }
 
-fn main() {
-    let xs = vec![
-        vec![1.0, 2.0],
-        vec![2.0, 1.0],
-        vec![3.0, 3.0],
-        vec![4.0, 2.0],
-        vec![5.0, 4.0],
-    ];
-    let ys = vec![9.0, 8.0, 16.0, 15.0, 23.0];
-    let mut model = LinearRegression::new(2);
+fn run() -> Result<(), Box<dyn Error>> {
+    // DEFAULTS TO PREDICTING A PENGUIN'S BODY MASS FROM ITS BILL AND FLIPPER MEASUREMENTS
+    let args: Vec<String> = env::args().skip(1).collect();
+    let (path, target, features) = match args.as_slice() {
+        [] => (DEFAULT_CSV, DEFAULT_TARGET, DEFAULT_FEATURES.to_vec()),
+        [path, target, features @ ..] if !features.is_empty() => (
+            path.as_str(),
+            target.as_str(),
+            features.iter().map(String::as_str).collect(),
+        ),
+        _ => return Err("expected a csv file, a target column, and at least one feature".into()),
+    };
 
-    let (grad_w, grad_b) = model.gradients(&xs, &ys);
-    println!("{:?} {}", grad_w, grad_b);
+    let data = load_csv(path, &features, target)?;
+    println!(
+        "loaded {} rows, skipped {} with missing values",
+        data.ys.len(),
+        data.skipped
+    );
 
-    for _ in 0..1000 {
-        model.step(&xs, &ys, 0.01);
+    let split = train_test_split(&data.xs, &data.ys)?;
+    println!(
+        "{} training rows, {} test rows",
+        split.train_ys.len(),
+        split.test_ys.len()
+    );
+
+    let (model, report) =
+        LinearRegression::fit(&split.train_xs, &split.train_ys, &TrainConfig::default())?;
+    println!(
+        "stopped after {} iterations (converged: {}, learning rate: {}, train loss: {})",
+        report.iterations, report.converged, report.final_learning_rate, report.train_loss
+    );
+    if !report.converged {
+        eprintln!("warning: training hit the iteration limit, so results may be inexact");
     }
-    println!("{:?} {}", model.weights, model.bias);
+    println!("features = {:?}", features);
+    println!("weights = {:?}, bias = {:?}", model.weights, model.bias);
 
-    let predictions: Vec<f64> = xs.iter().map(|x| model.predict(x)).collect();
-    println!("loss: {}", LinearRegression::mse(&predictions, &ys));
+    let train_predictions = model.predict_all(&split.train_xs)?;
+    let test_predictions = model.predict_all(&split.test_xs)?;
+    println!("train R²: {}", r2(&train_predictions, &split.train_ys)?);
+    println!("test R²: {}", r2(&test_predictions, &split.test_ys)?);
+    println!(
+        "typical test miss: {}",
+        mse(&test_predictions, &split.test_ys)?.sqrt()
+    );
 
-    println!("{}", model.predict(&[6.0, 5.0]));
+    Ok(())
 }
