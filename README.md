@@ -1,88 +1,110 @@
-# Linear Regression from Scratch in Rust
+# Rust ML from Scratch
 
-A multiple linear regression model trained with gradient descent, using only the Rust standard library. It includes its own CSV reader, feature scaling, and scoring, and it matches scikit-learn's results on well-conditioned data.
+Basic machine learning models written from scratch in Rust, using only the standard library. I built this to learn how the algorithms work, so everything down to the CSV reader is written by hand.
 
-## Quick start
+| Model | Predicts | Scores |
+|---|---|---|
+| `LinearRegression` | A number | `mse`, `r2` |
+| `LogisticRegression` | One of two classes | `log_loss`, `accuracy`, `precision`, `recall` |
 
-Requires Rust 1.88 or newer (the project uses the 2024 edition and let chains).
+Both models are trained with gradient descent, and both matched scikit-learn on the data they were checked against (see [Testing](#testing)).
 
-```
-cargo run
-```
+## Installation
 
-This trains on the included penguin dataset, predicting body mass from bill and flipper measurements:
+Requires Rust 1.88 or newer. Add this to your `Cargo.toml`:
 
-```
-loaded 342 rows, skipped 2 with missing values
-274 training rows, 68 test rows
-stopped after 139 iterations (converged: true, learning rate: 0.25, train loss: 160702.70046784967)
-features = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm"]
-weights = [2.5638399615625396, 32.8774788708226, 52.01954455589183], bias = -6924.6946614284625
-train R²: 0.7549520057958007
-test R²: 0.7872726327187334
-typical test miss: 351.9291333451723
+```toml
+[dependencies]
+rust_ml_from_scratch = { git = "https://github.com/Harsha685/rust-ml-from-scratch" }
 ```
 
-To use your own data, pass a CSV file, the column to predict, and one or more feature columns:
+## Usage
+
+```rust
+use rust_ml_from_scratch::dataset::{load_csv_labeled, train_test_split};
+use rust_ml_from_scratch::logistic_regression::LogisticRegression;
+use rust_ml_from_scratch::metrics::accuracy;
+use rust_ml_from_scratch::training::TrainConfig;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // THE TARGET BECOMES 1.0 FOR "Gentoo" AND 0.0 FOR EVERYTHING ELSE
+    let data = load_csv_labeled(
+        "examples/data/penguins.csv",
+        &["bill_depth_mm", "flipper_length_mm"],
+        "species",
+        "Gentoo",
+    )?;
+    let split = train_test_split(&data.xs, &data.ys)?;
+
+    let (model, report) =
+        LogisticRegression::fit(&split.train_xs, &split.train_ys, &TrainConfig::default())?;
+    println!("stopped because: {:?}", report.stop_reason);
+
+    let predictions = model.predict_all(&split.test_xs)?;
+    println!("test accuracy: {}", accuracy(&predictions, &split.test_ys)?);
+
+    // NO SCALING NEEDED: THE MODEL WORKS IN THE ORIGINAL UNITS OF YOUR DATA
+    println!("class for a new penguin: {}", model.predict(&[14.0, 215.0])?);
+    Ok(())
+}
+```
+
+`LinearRegression` works the same way, using `load_csv` for a numeric target.
+
+## Examples
+
+Both examples use the [Palmer Penguins](https://allisonhorst.github.io/palmerpenguins/) dataset, and both accept your own CSV file. Run one without arguments to see its default task.
 
 ```
-cargo run -- data/penguins.csv body_mass_g flipper_length_mm
+cargo run --example penguin_mass
+cargo run --example penguin_species
 ```
+
+| Example | Task | Test result |
+|---|---|---|
+| `penguin_mass` | Predict body mass from bill and flipper measurements | R² 0.787, typical miss 352 g |
+| `penguin_species` | Predict whether a penguin is a Gentoo | Accuracy 1.0 on 68 penguins |
+
+Gentoos are easy to separate from the other species in this data, so that perfect score says more about the task than the model. The harder penguin tasks are in [Testing](#testing).
 
 ## How it works
 
-**Model:** the prediction is a weighted sum of the features plus a bias.
+Both models follow the same steps:
 
-```
-ŷ = w₁·x₁ + w₂·x₂ + ... + b
-```
+1. **Scale the features** to mean 0 and standard deviation 1, so that one learning rate suits all of them.
+2. **Run gradient descent**, repeatedly moving each weight against its gradient.
+3. **Convert the weights back** to the original units, so new inputs don't need scaling.
 
-**Loss:** mean squared error measures how wrong the predictions are.
+They differ in their prediction and loss:
 
-```
-MSE = (1/n) · Σ (ŷᵢ − yᵢ)²
-```
+| | Linear regression | Logistic regression |
+|---|---|---|
+| Prediction | `ŷ = w·x + b` | `p = sigmoid(w·x + b)` |
+| Loss | Mean squared error | Log loss |
+| Gradient of `wⱼ` | `(2/n) · Σ (ŷᵢ − yᵢ) · xᵢⱼ` | `(1/n) · Σ (pᵢ − yᵢ) · xᵢⱼ` |
 
-**Training:** gradient descent repeatedly moves each value against its gradient.
+**Learning rate:** neither model can diverge. Linear regression halves its learning rate whenever a step wouldn't lower the loss enough. Logistic regression caps its rate at a limit that's mathematically guaranteed to lower the loss.
 
-```
-gradient of wⱼ = (2/n) · Σ (ŷᵢ − yᵢ) · xᵢⱼ
-gradient of b  = (2/n) · Σ (ŷᵢ − yᵢ)
+**Stopping:** training reports one of three outcomes in `FitReport::stop_reason`:
 
-wⱼ = wⱼ − learning_rate · gradient of wⱼ
-b  = b  − learning_rate · gradient of b
-```
-
-Three things make this reliable on real data:
-
-- **Scaling:** features and the target are scaled to mean 0 and standard deviation 1 before training. The final weights are converted back to original units, so you never need to scale inputs yourself.
-- **Automatic learning rate:** before each step, the model checks that the step lowers the loss enough, and halves the learning rate if it wouldn't. Training can't diverge, even from a learning rate that is far too large.
-- **Stopping rule:** training stops when the gradient is close to 0, and reports whether that happened before the iteration limit.
-
-## Using it in code
-
-```rust
-let data = load_csv("data/penguins.csv", &["flipper_length_mm"], "body_mass_g")?;
-let split = train_test_split(&data.xs, &data.ys)?;
-
-let (model, report) =
-    LinearRegression::fit(&split.train_xs, &split.train_ys, &TrainConfig::default())?;
-
-let predictions = model.predict_all(&split.test_xs)?;
-println!("test R²: {}", r2(&predictions, &split.test_ys)?);
-println!("converged: {}", report.converged);
-```
-
-`TrainConfig` sets the starting learning rate, the iteration limit, the stopping tolerance, and optional loss logging.
+- `Converged`: the gradient reached zero, so this is the best possible model.
+- `Separated`: classification only. A line splits the training data perfectly, so the weights would otherwise grow forever. Predictions are fine, but the weights have no single correct value.
+- `IterationLimit`: training ran out of iterations, so results may be inexact.
 
 ## Project layout
 
 | File | Contents |
 |---|---|
-| `src/linear_regression.rs` | The model, training, scaling, `mse`, `r2`, and their tests |
-| `src/csv.rs` | The CSV reader, train/test split, and their tests |
-| `src/main.rs` | The command-line program |
-| `data/penguins.csv` | The example dataset |
+| `src/linear_regression.rs` | The linear regression model |
+| `src/logistic_regression.rs` | The logistic regression model |
+| `src/training.rs` | `TrainConfig`, `FitReport`, and `StopReason` |
+| `src/metrics.rs` | All scoring functions |
+| `src/preprocessing.rs` | Feature scaling |
+| `src/dataset.rs` | The CSV reader and train/test split |
+| `src/error.rs` | `ModelError` |
+| `examples/` | The two penguin programs and their data |
+
+Run `cargo doc --open` for the full API documentation.
 
 ## Testing
 
@@ -90,38 +112,46 @@ println!("converged: {}", report.converged);
 cargo test
 ```
 
-The 22 unit tests cover known solutions, malformed CSV files, invalid input, and numeric edge cases.
+The unit tests cover known solutions, malformed CSV files, invalid input, and numeric edge cases.
 
-The model was also compared against scikit-learn 1.9.1 as a one-off check. That comparison script isn't part of this repo.
+Both models were also compared against scikit-learn 1.9.1 as a one-off check, before the two models were combined into this crate. Those comparison scripts aren't part of this repo.
+
+**Linear regression:**
 
 | Check | Result |
 |---|---|
 | Penguin test R² | 0.78727263 for both |
-| 300 random datasets with widely varying scales | All converged; predictions differed by at most 6.7 × 10⁻⁸ standard deviations of `y` |
+| 300 random datasets with widely varying scales | All converged; predictions within 6.7 × 10⁻⁸ standard deviations of `y` |
 | 1,500 corrupted CSV files | No panics |
 
-## Behavior on difficult data
+**Logistic regression**, with scikit-learn's regularization turned off:
 
-| Data | What happens |
-|---|---|
-| Missing or non-numeric values, `NaN`, `inf`, short rows | The row is skipped and counted |
-| Quoted cells, Windows line endings, byte order marks | Handled |
-| `NaN` or infinity passed directly to `fit` or `predict` | Returns an error |
-| A constant feature | Gets a weight of 0 |
-| A constant target | Predicts that constant |
-| Duplicate features | Predictions are correct; the weight is shared between the copies |
-| Features on extremely different scales (10⁻⁶ to 10⁶) | Works. On this data, scikit-learn's raw fit dropped a feature, scoring R² 0.16 to this model's 0.92, unless the data was scaled first |
+| Predicting | Features | Stopped because | Accuracy | scikit-learn |
+|---|---|---|---|---|
+| Gentoo | 3 | Separated | 1.0000 | 1.0000 |
+| Adelie | 3 | Converged | 0.9853 | 0.9853 |
+| Chinstrap | 3 | Converged | 0.9265 | 0.9265 |
+| Male | 3 | Converged | 0.6970 | 0.6970 |
+| Gentoo | 1 | Converged | 0.7059 | 0.7059 |
+| Adelie | 1 | Converged | 0.9706 | 0.9706 |
+| Chinstrap | 2 | Converged | 0.7647 | 0.7647 |
+
+Of 300 random logistic datasets, 289 converged to within 1.5 × 10⁻⁴ of scikit-learn's raw outputs (`w·x + b`), and 2 stopped as separated. The other 9 hit the iteration limit and differed widely from scikit-learn. 1,500 corrupted CSV files caused no panics.
 
 ## Limitations
 
-- **Very highly correlated features train slowly.** At a correlation of 0.9999 between two features, training hit the 100,000-iteration limit with `converged: false`, and the weights differed from the exact solution by up to 7%. Test R² was still within 0.0003 of scikit-learn's. Exact solvers don't have this problem.
-- **More features than rows has no single answer.** Many exact fits exist, and this model finds a different one from scikit-learn, so test predictions differ.
-- **Precision is lower than an exact solver.** With the default tolerance, predictions matched scikit-learn to within about 10⁻⁷ standard deviations of `y`, and weights to about 5 to 8 significant digits.
-- **Only numeric columns are used.** Categories such as species aren't encoded.
-- **Outliers aren't handled.** Squared error lets one extreme value pull the whole line.
-- **Very large values are rejected.** If a column's squared differences overflow `f64`, for example at around 10¹⁶⁰ and above, `fit` returns an error.
+- **No regularization.** scikit-learn's `LogisticRegression` uses it by default, so its default weights will differ.
+- **Slow on hard data.** Gradient descent can use many iterations on highly correlated features or nearly separable classes. Check `stop_reason`, since results after `IterationLimit` may be inexact. For example, at a correlation of 0.9999 between two features, linear regression weights were off by up to 7% after 100,000 iterations, while predictions stayed close.
+- **More features than rows has no single answer.** Linear regression finds an exact fit, but not the same one as scikit-learn.
+- **Two classes only.** Logistic regression doesn't handle more than two classes.
+- **Numeric features only.** Categories such as species can only be used as a classification target.
 - **The train/test split is fixed.** Every 5th row is used for testing, with no shuffling.
+- **Very large values are rejected.** `fit` returns an error if a column's squared differences overflow `f64`.
 
 ## Dataset
 
-`data/penguins.csv` is the Palmer Penguins dataset, collected by Dr. Kristen Gorman at Palmer Station, Antarctica. It was released by Horst, Hill, and Gorman under the CC0 license in the [palmerpenguins](https://allisonhorst.github.io/palmerpenguins/) package.
+`examples/data/penguins.csv` is the Palmer Penguins dataset, collected by Dr. Kristen Gorman at Palmer Station, Antarctica. It was released by Horst, Hill, and Gorman under the CC0 license.
+
+## License
+
+[MIT](LICENSE)

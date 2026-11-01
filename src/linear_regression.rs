@@ -1,86 +1,15 @@
-use std::error::Error;
-use std::fmt;
+//! Linear regression trained with gradient descent, for predicting a number.
 
-// EVERYTHING THAT CAN GO WRONG WITH BAD INPUT
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModelError {
-    EmptyData,
-    NoFeatures,
-    LengthMismatch {
-        left: usize,
-        right: usize,
-    },
-    RaggedRow {
-        row: usize,
-        expected: usize,
-        found: usize,
-    },
-    NonFiniteValue {
-        row: usize,
-    },
-    NumericOverflow,
-    InvalidConfig(&'static str),
-}
+use crate::error::ModelError;
+use crate::metrics::mse;
+use crate::preprocessing::{mean_and_std, standardize};
+use crate::training::{FitReport, StopReason, TrainConfig, validate_config, validate_rows};
 
-impl fmt::Display for ModelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyData => write!(f, "no data was provided"),
-            Self::NoFeatures => write!(f, "rows have no features"),
-            Self::LengthMismatch { left, right } => {
-                write!(f, "lengths do not match: {} and {}", left, right)
-            }
-            Self::RaggedRow {
-                row,
-                expected,
-                found,
-            } => {
-                write!(
-                    f,
-                    "row {} has {} features, expected {}",
-                    row, found, expected
-                )
-            }
-            Self::NonFiniteValue { row } => write!(f, "row {} contains NaN or infinity", row),
-            Self::NumericOverflow => write!(f, "values are too large to compute with"),
-            Self::InvalidConfig(reason) => write!(f, "invalid config: {}", reason),
-        }
-    }
-}
+// WHERE THE LEARNING RATE STARTS WHEN THE CONFIG DOESN'T SET ONE
+const DEFAULT_LEARNING_RATE: f64 = 0.5;
 
-impl Error for ModelError {}
-
-// TRAINING SETTINGS
-#[derive(Debug, Clone)]
-pub struct TrainConfig {
-    pub learning_rate: f64, // STARTING RATE, LOWERED AUTOMATICALLY IF IT IS TOO HIGH
-    pub max_iterations: usize,
-    pub tolerance: f64, // STOP WHEN THE GRADIENT (ON SCALED DATA) IS THIS SMALL
-    pub log_every: Option<usize>,
-}
-
-impl Default for TrainConfig {
-    fn default() -> Self {
-        Self {
-            learning_rate: 0.5,
-            max_iterations: 100_000,
-            tolerance: 1e-8,
-            log_every: None,
-        }
-    }
-}
-
-// WHAT HAPPENED DURING TRAINING
-#[derive(Debug, Clone)]
-pub struct FitReport {
-    pub iterations: usize,
-    pub converged: bool,
-    pub final_learning_rate: f64,
-    pub train_loss: f64,
-}
-
-// A TRAINED MODEL. WEIGHTS AND BIAS ARE IN THE ORIGINAL UNITS OF THE DATA,
-// SO NEW INPUTS NEVER NEED SCALING BEFORE PREDICTING.
+/// A trained linear regression model. Weights and bias are in the original
+/// units of the data, so new inputs never need scaling before predicting.
 #[derive(Debug, Clone)]
 pub struct LinearRegression {
     pub weights: Vec<f64>,
@@ -88,7 +17,11 @@ pub struct LinearRegression {
 }
 
 impl LinearRegression {
-    // SCALES THE DATA, RUNS GRADIENT DESCENT, AND CONVERTS THE RESULT BACK TO ORIGINAL UNITS
+    /// Trains a model by scaling the data, running gradient descent, and
+    /// converting the result back to original units.
+    ///
+    /// `xs` holds one row of features per example, and `ys` holds their target values.
+    /// Returns an error for empty or malformed data, `NaN` or infinite values, or invalid settings.
     pub fn fit(
         xs: &[Vec<f64>],
         ys: &[f64],
@@ -109,8 +42,8 @@ impl LinearRegression {
             let train_loss = mse(&model.predict_all(xs)?, ys)?;
             let report = FitReport {
                 iterations: 0,
-                converged: true,
-                final_learning_rate: config.learning_rate,
+                stop_reason: StopReason::Converged,
+                learning_rate: config.learning_rate.unwrap_or(DEFAULT_LEARNING_RATE),
                 train_loss,
             };
             return Ok((model, report));
@@ -121,7 +54,7 @@ impl LinearRegression {
             weights: vec![0.0; means.len()],
             bias: 0.0,
         };
-        let (iterations, converged, final_learning_rate) =
+        let (iterations, stop_reason, learning_rate) =
             gradient_descent(&mut state, &scaled_xs, &scaled_ys, config)?;
 
         // UNDO THE SCALING: ŷ = y_mean + y_std · (b + Σ w · (x − mean) / std)
@@ -141,14 +74,14 @@ impl LinearRegression {
         let train_loss = mse(&model.predict_all(xs)?, ys)?;
         let report = FitReport {
             iterations,
-            converged,
-            final_learning_rate,
+            stop_reason,
+            learning_rate,
             train_loss,
         };
         Ok((model, report))
     }
 
-    // CALCULATES ŷ
+    /// Predicts the target for one row of features.
     pub fn predict(&self, x: &[f64]) -> Result<f64, ModelError> {
         if x.len() != self.weights.len() {
             return Err(ModelError::LengthMismatch {
@@ -162,7 +95,7 @@ impl LinearRegression {
         Ok(evaluate(&self.weights, self.bias, x))
     }
 
-    // CALCULATES ŷ FOR EVERY ROW
+    /// Predicts the target for every row.
     pub fn predict_all(&self, xs: &[Vec<f64>]) -> Result<Vec<f64>, ModelError> {
         xs.iter().map(|x| self.predict(x)).collect()
     }
@@ -211,7 +144,7 @@ fn gradients(params: &Params, xs: &[Vec<f64>], ys: &[f64]) -> (Vec<f64>, f64) {
     (grad_w, 2.0 * grad_b / n)
 }
 
-// RUNS GRADIENT DESCENT, RETURNING (ITERATIONS, CONVERGED, FINAL LEARNING RATE).
+// RUNS GRADIENT DESCENT, RETURNING (ITERATIONS, STOP REASON, FINAL LEARNING RATE).
 // A STEP IS ONLY TAKEN IF IT LOWERS THE LOSS ENOUGH (THE ARMIJO CONDITION). OTHERWISE THE
 // LEARNING RATE IS HALVED FIRST, SO THE LOSS CAN NEVER DIVERGE.
 //
@@ -226,24 +159,17 @@ fn gradient_descent(
     xs: &[Vec<f64>],
     ys: &[f64],
     config: &TrainConfig,
-) -> Result<(usize, bool, f64), ModelError> {
-    let mut learning_rate = config.learning_rate;
+) -> Result<(usize, StopReason, f64), ModelError> {
+    let mut learning_rate = config.learning_rate.unwrap_or(DEFAULT_LEARNING_RATE);
 
     for i in 0..config.max_iterations {
-        if let Some(every) = config.log_every
-            && i % every == 0
-        {
-            let loss = scaled_loss(&params.weights, params.bias, xs, ys);
-            println!("iteration {}: scaled loss = {}", i, loss);
-        }
-
         let (grad_w, grad_b) = gradients(params, xs, ys);
         let squared_norm: f64 = grad_w.iter().map(|g| g * g).sum::<f64>() + grad_b * grad_b;
         if !squared_norm.is_finite() {
             return Err(ModelError::NumericOverflow);
         }
         if squared_norm.sqrt() <= config.tolerance {
-            return Ok((i, true, learning_rate));
+            return Ok((i, StopReason::Converged, learning_rate));
         }
 
         let mean_squared_move = scaled_loss(&grad_w, grad_b, xs, &vec![0.0; ys.len()]);
@@ -262,169 +188,26 @@ fn gradient_descent(
 
     let (grad_w, grad_b) = gradients(params, xs, ys);
     let squared_norm: f64 = grad_w.iter().map(|g| g * g).sum::<f64>() + grad_b * grad_b;
-    Ok((
-        config.max_iterations,
-        squared_norm.sqrt() <= config.tolerance,
-        learning_rate,
-    ))
+    let stop_reason = if squared_norm.sqrt() <= config.tolerance {
+        StopReason::Converged
+    } else {
+        StopReason::IterationLimit
+    };
+    Ok((config.max_iterations, stop_reason, learning_rate))
 }
 
 fn validate_data(xs: &[Vec<f64>], ys: &[f64]) -> Result<(), ModelError> {
-    if xs.is_empty() {
-        return Err(ModelError::EmptyData);
-    }
-    if xs.len() != ys.len() {
-        return Err(ModelError::LengthMismatch {
-            left: xs.len(),
-            right: ys.len(),
-        });
-    }
-    let n_features = xs[0].len();
-    if n_features == 0 {
-        return Err(ModelError::NoFeatures);
-    }
-    for (row, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
-        if x.len() != n_features {
-            return Err(ModelError::RaggedRow {
-                row,
-                expected: n_features,
-                found: x.len(),
-            });
-        }
-        if !y.is_finite() || x.iter().any(|v| !v.is_finite()) {
-            return Err(ModelError::NonFiniteValue { row });
-        }
+    validate_rows(xs, ys)?;
+    if let Some(row) = ys.iter().position(|y| !y.is_finite()) {
+        return Err(ModelError::NonFiniteValue { row });
     }
     Ok(())
-}
-
-fn validate_config(config: &TrainConfig) -> Result<(), ModelError> {
-    if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
-        return Err(ModelError::InvalidConfig("learning_rate must be above 0"));
-    }
-    if config.max_iterations == 0 {
-        return Err(ModelError::InvalidConfig("max_iterations must be above 0"));
-    }
-    if !config.tolerance.is_finite() || config.tolerance < 0.0 {
-        return Err(ModelError::InvalidConfig("tolerance must not be negative"));
-    }
-    if config.log_every == Some(0) {
-        return Err(ModelError::InvalidConfig("log_every must be above 0"));
-    }
-    Ok(())
-}
-
-// MEAN AND STD OF A COLUMN. STD IS 0 FOR A COLUMN THAT ONLY VARIES BY ROUNDING NOISE,
-// SUCH AS 0.1 REPEATED, WHICH WOULD OTHERWISE BE SCALED INTO MEANINGLESS LARGE VALUES.
-fn mean_and_std(values: impl Iterator<Item = f64> + Clone) -> Result<(f64, f64), ModelError> {
-    let mut n = 0.0;
-    let mut sum = 0.0;
-    let mut largest: f64 = 0.0;
-    for v in values.clone() {
-        n += 1.0;
-        sum += v;
-        largest = largest.max(v.abs());
-    }
-    let mean = sum / n;
-
-    let mut squared_diffs = 0.0;
-    for v in values {
-        squared_diffs += (v - mean).powi(2);
-    }
-    let std = (squared_diffs / n).sqrt();
-
-    if !mean.is_finite() || !std.is_finite() {
-        return Err(ModelError::NumericOverflow);
-    }
-    if std <= largest * 1e-12 {
-        return Ok((mean, 0.0));
-    }
-    Ok((mean, std))
-}
-
-// SCALED ROWS, PLUS THE MEANS AND STDS USED TO SCALE THEM
-type Standardized = (Vec<Vec<f64>>, Vec<f64>, Vec<f64>);
-
-// SCALES EACH FEATURE TO MEAN 0 AND STD 1
-fn standardize(xs: &[Vec<f64>]) -> Result<Standardized, ModelError> {
-    let n_features = xs[0].len();
-    let mut means = vec![0.0; n_features];
-    let mut stds = vec![0.0; n_features];
-
-    for j in 0..n_features {
-        let (mean, std) = mean_and_std(xs.iter().map(|x| x[j]))?;
-        means[j] = mean;
-        stds[j] = std;
-    }
-
-    let mut scaled = Vec::with_capacity(xs.len());
-    for x in xs {
-        scaled.push(scale_row(x, &means, &stds));
-    }
-
-    Ok((scaled, means, stds))
-}
-
-// SCALES ONE ROW USING SAVED MEANS AND STDS
-fn scale_row(x: &[f64], means: &[f64], stds: &[f64]) -> Vec<f64> {
-    let mut row = Vec::with_capacity(x.len());
-    for j in 0..x.len() {
-        // A COLUMN WITH ONE REPEATED VALUE HAS STD 0, SO IT SCALES TO 0 INSTEAD OF DIVIDING BY 0
-        if stds[j] == 0.0 {
-            row.push(0.0);
-        } else {
-            row.push((x[j] - means[j]) / stds[j]);
-        }
-    }
-    row
-}
-
-fn validate_scores(predictions: &[f64], targets: &[f64]) -> Result<(), ModelError> {
-    if predictions.len() != targets.len() {
-        return Err(ModelError::LengthMismatch {
-            left: predictions.len(),
-            right: targets.len(),
-        });
-    }
-    if targets.is_empty() {
-        return Err(ModelError::EmptyData);
-    }
-    Ok(())
-}
-
-// CALCULATES LOSS
-pub fn mse(predictions: &[f64], targets: &[f64]) -> Result<f64, ModelError> {
-    validate_scores(predictions, targets)?;
-    let mut sum = 0.0;
-    for (prediction, target) in predictions.iter().zip(targets.iter()) {
-        let error = prediction - target;
-        sum += error * error;
-    }
-    Ok(sum / predictions.len() as f64)
-}
-
-// CALCULATES R². A CONSTANT TARGET SCORES 1 IF PREDICTED PERFECTLY, OTHERWISE 0.
-pub fn r2(predictions: &[f64], targets: &[f64]) -> Result<f64, ModelError> {
-    validate_scores(predictions, targets)?;
-
-    let ss_res = predictions
-        .iter()
-        .zip(targets.iter())
-        .map(|(p, t)| (t - p).powi(2))
-        .sum::<f64>();
-
-    let mean = targets.iter().sum::<f64>() / targets.len() as f64;
-    let ss_tot = targets.iter().map(|t| (t - mean).powi(2)).sum::<f64>();
-
-    if ss_tot == 0.0 {
-        return Ok(if ss_res == 0.0 { 1.0 } else { 0.0 });
-    }
-    Ok(1.0 - ss_res / ss_tot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::r2;
 
     fn fit(xs: &[Vec<f64>], ys: &[f64]) -> LinearRegression {
         LinearRegression::fit(xs, ys, &TrainConfig::default())
@@ -454,7 +237,7 @@ mod tests {
     fn recovers_known_line_in_original_units() {
         let (xs, ys) = sample();
         let (model, report) = LinearRegression::fit(&xs, &ys, &TrainConfig::default()).unwrap();
-        assert!(report.converged);
+        assert_eq!(report.stop_reason, StopReason::Converged);
         assert!(close(model.weights[0], 2.0, 1e-6));
         assert!(close(model.weights[1], 0.03, 1e-6));
         assert!(close(model.bias, 1.0, 1e-6));
@@ -475,11 +258,11 @@ mod tests {
     fn huge_learning_rate_recovers_instead_of_diverging() {
         let (xs, ys) = sample();
         let config = TrainConfig {
-            learning_rate: 1e6,
+            learning_rate: Some(1e6),
             ..TrainConfig::default()
         };
         let (model, report) = LinearRegression::fit(&xs, &ys, &config).unwrap();
-        assert!(report.final_learning_rate < 1e6);
+        assert!(report.learning_rate < 1e6);
         assert!(close(model.weights[0], 2.0, 1e-6));
     }
 
@@ -493,7 +276,11 @@ mod tests {
             })
             .collect();
         let ys: Vec<f64> = (0..50).map(|i| 2.0 * i as f64).collect();
-        let model = fit(&xs, &ys);
+        let config = TrainConfig {
+            max_iterations: 100_000,
+            ..TrainConfig::default()
+        };
+        let (model, _) = LinearRegression::fit(&xs, &ys, &config).unwrap();
         assert!(r2(&model.predict_all(&xs).unwrap(), &ys).unwrap() > 0.999);
     }
 
@@ -586,11 +373,11 @@ mod tests {
         let (xs, ys) = sample();
         for config in [
             TrainConfig {
-                learning_rate: 0.0,
+                learning_rate: Some(0.0),
                 ..TrainConfig::default()
             },
             TrainConfig {
-                learning_rate: f64::NAN,
+                learning_rate: Some(f64::NAN),
                 ..TrainConfig::default()
             },
             TrainConfig {
@@ -599,10 +386,6 @@ mod tests {
             },
             TrainConfig {
                 tolerance: -1.0,
-                ..TrainConfig::default()
-            },
-            TrainConfig {
-                log_every: Some(0),
                 ..TrainConfig::default()
             },
         ] {
@@ -621,7 +404,7 @@ mod tests {
             ..TrainConfig::default()
         };
         let (_, report) = LinearRegression::fit(&xs, &ys, &config).unwrap();
-        assert!(!report.converged);
+        assert_eq!(report.stop_reason, StopReason::IterationLimit);
         assert_eq!(report.iterations, 1);
     }
 
@@ -636,20 +419,6 @@ mod tests {
         assert!(matches!(
             model.predict(&[1.0, f64::NAN]),
             Err(ModelError::NonFiniteValue { .. })
-        ));
-    }
-
-    #[test]
-    fn scoring_edge_cases() {
-        assert_eq!(mse(&[1.0, 3.0], &[1.0, 1.0]).unwrap(), 2.0);
-        assert_eq!(r2(&[1.0, 2.0], &[1.0, 2.0]).unwrap(), 1.0);
-        assert_eq!(r2(&[1.5, 1.5], &[1.0, 2.0]).unwrap(), 0.0);
-        assert_eq!(r2(&[5.0, 5.0], &[5.0, 5.0]).unwrap(), 1.0);
-        assert_eq!(r2(&[4.0, 6.0], &[5.0, 5.0]).unwrap(), 0.0);
-        assert_eq!(mse(&[], &[]).unwrap_err(), ModelError::EmptyData);
-        assert!(matches!(
-            r2(&[1.0], &[]),
-            Err(ModelError::LengthMismatch { .. })
         ));
     }
 }

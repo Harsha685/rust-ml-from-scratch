@@ -1,13 +1,17 @@
-mod csv;
-mod linear_regression;
+//! Predicts a penguin's body mass from its bill and flipper measurements.
+//!
+//! Run it with `cargo run --example penguin_mass`, or pass your own data:
+//! `cargo run --example penguin_mass -- <csv file> <target column> <feature column>...`
 
-use csv::{load_csv, train_test_split};
-use linear_regression::{LinearRegression, TrainConfig, mse, r2};
+use rust_ml_from_scratch::dataset::{load_csv, train_test_split};
+use rust_ml_from_scratch::linear_regression::LinearRegression;
+use rust_ml_from_scratch::metrics::{mse, r2};
+use rust_ml_from_scratch::training::{StopReason, TrainConfig};
 use std::env;
 use std::error::Error;
 use std::process::ExitCode;
 
-const DEFAULT_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/penguins.csv");
+const DEFAULT_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/data/penguins.csv");
 const DEFAULT_TARGET: &str = "body_mass_g";
 const DEFAULT_FEATURES: [&str; 3] = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm"];
 
@@ -16,7 +20,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {}", error);
-            eprintln!("usage: cargo run -- [<csv file> <target column> <feature column>...]");
+            eprintln!(
+                "usage: cargo run --example penguin_mass -- [<csv file> <target column> <feature column>...]"
+            );
             ExitCode::FAILURE
         }
     }
@@ -53,9 +59,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         LinearRegression::fit(&split.train_xs, &split.train_ys, &TrainConfig::default())?;
     println!(
         "stopped after {} iterations (converged: {}, learning rate: {}, train loss: {})",
-        report.iterations, report.converged, report.final_learning_rate, report.train_loss
+        report.iterations,
+        report.stop_reason == StopReason::Converged,
+        report.learning_rate,
+        report.train_loss
     );
-    if !report.converged {
+    if report.stop_reason != StopReason::Converged {
         eprintln!("warning: training hit the iteration limit, so results may be inexact");
     }
     println!("features = {:?}", features);

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "Linear_Regression"
+name = "rust_ml_from_scratch"
 version = "0.1.0"

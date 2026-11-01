@@ -1,6 +1,13 @@
 [package]
-name = "Linear_Regression"
+name = "rust_ml_from_scratch"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Basic machine learning models written from scratch using only the Rust standard library"
+license = "MIT"
+repository = "https://github.com/Harsha685/rust-ml-from-scratch"
+readme = "README.md"
+keywords = ["machine-learning", "regression", "classification", "from-scratch"]
+categories = ["science", "algorithms"]
 
 [dependencies]
